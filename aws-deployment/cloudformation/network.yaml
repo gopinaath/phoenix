@@ -10,9 +10,7 @@ Parameters:
     Type: String
   AvailabilityZones:
     Type: CommaDelimitedList
-
-Conditions:
-  HasThreeAZs: !Equals [!Select [2, !Ref AvailabilityZones], !Select [2, !Ref AvailabilityZones]]
+    Description: List of 2 Availability Zones for deployment
 
 Resources:
   #============================================================================
