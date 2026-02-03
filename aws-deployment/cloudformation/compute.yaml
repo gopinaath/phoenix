@@ -34,6 +34,21 @@ Parameters:
     Type: Number
   PhoenixImageTag:
     Type: String
+  EnableHTTPS:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable HTTPS with ACM certificate (requires DNS validation)
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Domain name for ACM certificate (required if EnableHTTPS is true)
+
+Conditions:
+  UseHTTPS: !Equals [!Ref EnableHTTPS, 'true']
+  UseHTTPOnly: !Equals [!Ref EnableHTTPS, 'false']
 
 Resources:
   #============================================================================
@@ -147,7 +162,7 @@ Resources:
         - Key: Name
           Value: !Sub '${ProjectName}-${Environment}-grpc-tg'
 
-  # HTTPS Listener (redirects HTTP to HTTPS)
+  # HTTP Listener - forwards to target group (or redirects to HTTPS if enabled)
   HTTPListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -155,15 +170,36 @@ Resources:
       Port: 80
       Protocol: HTTP
       DefaultActions:
-        - Type: redirect
-          RedirectConfig:
-            Protocol: HTTPS
-            Port: '443'
-            StatusCode: HTTP_301
+        - !If
+          - UseHTTPS
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: '443'
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref HTTPTargetGroup
 
-  # HTTPS Listener
+  # HTTP Listener Rule for gRPC (when not using HTTPS)
+  HTTPGRPCListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: UseHTTPOnly
+    Properties:
+      ListenerArn: !Ref HTTPListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/opentelemetry.proto.collector.trace.v1.*'
+            - '/grpc.health.v1.*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref GRPCTargetGroup
+
+  # HTTPS Listener (only when HTTPS is enabled)
   HTTPSListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: UseHTTPS
     Properties:
       LoadBalancerArn: !Ref ApplicationLoadBalancer
       Port: 443
@@ -175,9 +211,10 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref HTTPTargetGroup
 
-  # Listener Rule for gRPC traffic
+  # Listener Rule for gRPC traffic (HTTPS)
   GRPCListenerRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: UseHTTPS
     Properties:
       ListenerArn: !Ref HTTPSListener
       Priority: 10
@@ -191,12 +228,13 @@ Resources:
           TargetGroupArn: !Ref GRPCTargetGroup
 
   #============================================================================
-  # ACM Certificate (DNS validation required)
+  # ACM Certificate (only when HTTPS is enabled)
   #============================================================================
   ACMCertificate:
     Type: AWS::CertificateManager::Certificate
+    Condition: UseHTTPS
     Properties:
-      DomainName: !Sub '${ProjectName}.${Environment}.example.com'
+      DomainName: !Ref DomainName
       ValidationMethod: DNS
       Tags:
         - Key: Name
@@ -274,8 +312,7 @@ Resources:
   ECSService:
     Type: AWS::ECS::Service
     DependsOn:
-      - HTTPSListener
-      - GRPCListenerRule
+      - HTTPListener
     Properties:
       ServiceName: !Sub '${ProjectName}-${Environment}'
       Cluster: !Ref ECSCluster
@@ -432,11 +469,17 @@ Outputs:
 
   PhoenixURL:
     Description: Phoenix Application URL
-    Value: !Sub 'https://${ProjectName}.${Environment}.example.com'
+    Value: !If
+      - UseHTTPS
+      - !Sub 'https://${DomainName}'
+      - !Sub 'http://${ApplicationLoadBalancer.DNSName}'
 
   OTLPEndpoint:
     Description: Phoenix OTLP gRPC Endpoint
-    Value: !Sub 'https://${ProjectName}.${Environment}.example.com:443'
+    Value: !If
+      - UseHTTPS
+      - !Sub 'https://${DomainName}:443'
+      - !Sub 'http://${ApplicationLoadBalancer.DNSName}:80'
 
   ALBDNSName:
     Description: ALB DNS Name (for DNS CNAME record)
