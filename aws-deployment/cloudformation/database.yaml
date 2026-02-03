@@ -76,7 +76,7 @@ Resources:
       DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}'
       DBInstanceClass: !Ref DBInstanceClass
       Engine: postgres
-      EngineVersion: '16.4'
+      EngineVersion: '16.6'
       AllocatedStorage: !Ref DBAllocatedStorage
       MaxAllocatedStorage: 1000
       StorageType: gp3
