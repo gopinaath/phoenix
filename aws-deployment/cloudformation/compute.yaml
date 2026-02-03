@@ -136,9 +136,11 @@ Resources:
         - Key: Name
           Value: !Sub '${ProjectName}-${Environment}-http-tg'
 
-  # gRPC Target Group (OTLP)
+  # gRPC Target Group (OTLP) - only created when HTTPS is enabled
+  # gRPC requires HTTP/2 which only works over HTTPS
   GRPCTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: UseHTTPS
     Properties:
       Name: !Sub '${ProjectName}-${Environment}-grpc'
       VpcId: !Ref VpcId
@@ -180,21 +182,8 @@ Resources:
           - Type: forward
             TargetGroupArn: !Ref HTTPTargetGroup
 
-  # HTTP Listener Rule for gRPC (when not using HTTPS)
-  HTTPGRPCListenerRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Condition: UseHTTPOnly
-    Properties:
-      ListenerArn: !Ref HTTPListener
-      Priority: 10
-      Conditions:
-        - Field: path-pattern
-          Values:
-            - '/opentelemetry.proto.collector.trace.v1.*'
-            - '/grpc.health.v1.*'
-      Actions:
-        - Type: forward
-          TargetGroupArn: !Ref GRPCTargetGroup
+  # Note: gRPC requires HTTP/2 which only works with HTTPS
+  # In HTTP-only mode, OTLP traces must be sent via HTTP protocol (not gRPC)
 
   # HTTPS Listener (only when HTTPS is enabled)
   HTTPSListener:
@@ -307,12 +296,54 @@ Resources:
           Value: !Ref ProjectName
 
   #============================================================================
-  # ECS Service
+  # ECS Service (HTTP-only mode - no gRPC support)
   #============================================================================
-  ECSService:
+  ECSServiceHTTP:
     Type: AWS::ECS::Service
+    Condition: UseHTTPOnly
     DependsOn:
       - HTTPListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref ECSSecurityGroupId
+      LoadBalancers:
+        - ContainerName: phoenix
+          ContainerPort: 6006
+          TargetGroupArn: !Ref HTTPTargetGroup
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #============================================================================
+  # ECS Service (HTTPS mode - with gRPC/OTLP support)
+  #============================================================================
+  ECSServiceHTTPS:
+    Type: AWS::ECS::Service
+    Condition: UseHTTPS
+    DependsOn:
+      - HTTPSListener
+      - GRPCListenerRule
     Properties:
       ServiceName: !Sub '${ProjectName}-${Environment}'
       Cluster: !Ref ECSCluster
@@ -356,7 +387,10 @@ Resources:
     Properties:
       MinCapacity: !Ref MinCount
       MaxCapacity: !Ref MaxCount
-      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ResourceId: !If
+        - UseHTTPS
+        - !Sub 'service/${ECSCluster}/${ECSServiceHTTPS.Name}'
+        - !Sub 'service/${ECSCluster}/${ECSServiceHTTP.Name}'
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
       RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
@@ -406,7 +440,10 @@ Resources:
         - Name: ClusterName
           Value: !Ref ECSCluster
         - Name: ServiceName
-          Value: !GetAtt ECSService.Name
+          Value: !If
+            - UseHTTPS
+            - !GetAtt ECSServiceHTTPS.Name
+            - !GetAtt ECSServiceHTTP.Name
 
   ServiceMemoryAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -424,7 +461,10 @@ Resources:
         - Name: ClusterName
           Value: !Ref ECSCluster
         - Name: ServiceName
-          Value: !GetAtt ECSService.Name
+          Value: !If
+            - UseHTTPS
+            - !GetAtt ECSServiceHTTPS.Name
+            - !GetAtt ECSServiceHTTP.Name
 
   ALB5xxAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -465,7 +505,10 @@ Outputs:
 
   ServiceName:
     Description: ECS Service Name
-    Value: !GetAtt ECSService.Name
+    Value: !If
+      - UseHTTPS
+      - !GetAtt ECSServiceHTTPS.Name
+      - !GetAtt ECSServiceHTTP.Name
 
   PhoenixURL:
     Description: Phoenix Application URL
