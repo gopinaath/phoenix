@@ -116,8 +116,8 @@ Parameters:
 
   PhoenixImageTag:
     Type: String
-    Default: version-2.9.0-nonroot
-    Description: Phoenix Docker image tag
+    Default: latest-nonroot
+    Description: Phoenix Docker image tag (e.g., latest-nonroot, 12.33.1-nonroot)
 
 Resources:
   # Network Stack
