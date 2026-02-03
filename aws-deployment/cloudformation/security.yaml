@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Phoenix - Security Stack (Security Groups, IAM Roles, Cognito with Email Allow-list)'
+Description: 'Phoenix - Security Stack (Security Groups, IAM Roles, Cognito with Magic Link Auth)'
 
 Parameters:
   Environment:
@@ -12,6 +12,22 @@ Parameters:
     Type: CommaDelimitedList
     Default: 'example.com,company.com'
     Description: Comma-separated list of allowed email domains for Cognito sign-up
+  MagicLinkExpiryMinutes:
+    Type: Number
+    Default: 15
+    Description: Magic link expiry time in minutes
+  MaxConcurrentSessions:
+    Type: Number
+    Default: 2
+    Description: Maximum number of concurrent device sessions per user
+  SessionDurationDays:
+    Type: Number
+    Default: 7
+    Description: Session duration in days
+  AppDomainName:
+    Type: String
+    Default: 'phoenix.example.com'
+    Description: Application domain name for magic link URLs
 
 Resources:
   #============================================================================
@@ -118,6 +134,65 @@ Resources:
       TargetKeyId: !Ref KMSKey
 
   #============================================================================
+  # DynamoDB Tables for Magic Link and Session Management
+  #============================================================================
+  MagicLinkTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-magic-links'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: token
+          AttributeType: S
+      KeySchema:
+        - AttributeName: token
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  UserSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-user-sessions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: sessionId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #============================================================================
   # IAM Roles
   #============================================================================
   TaskExecutionRole:
@@ -185,36 +260,29 @@ Resources:
                     cloudwatch:namespace: !Sub '${ProjectName}/${Environment}'
 
   #============================================================================
-  # Cognito User Pool with Email Domain Allow-list
+  # Cognito User Pool with Magic Link Authentication
   #============================================================================
   UserPool:
     Type: AWS::Cognito::UserPool
+    DependsOn:
+      - DefineAuthChallengeLambda
+      - CreateAuthChallengeLambda
+      - VerifyAuthChallengeLambda
+      - PreSignUpLambda
+      - PostAuthenticationLambda
     Properties:
       UserPoolName: !Sub '${ProjectName}-${Environment}-users'
       UsernameAttributes:
         - email
       AutoVerifiedAttributes:
         - email
-      MfaConfiguration: OPTIONAL
-      EnabledMfas:
-        - SOFTWARE_TOKEN_MFA
-      Policies:
-        PasswordPolicy:
-          MinimumLength: 12
-          RequireLowercase: true
-          RequireNumbers: true
-          RequireSymbols: true
-          RequireUppercase: true
-          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: 'OFF'
       AccountRecoverySetting:
         RecoveryMechanisms:
           - Name: verified_email
             Priority: 1
       AdminCreateUserConfig:
         AllowAdminCreateUserOnly: false
-        InviteMessageTemplate:
-          EmailSubject: 'Your Phoenix account'
-          EmailMessage: 'Your username is {username} and temporary password is {####}'
       EmailConfiguration:
         EmailSendingAccount: COGNITO_DEFAULT
       Schema:
@@ -223,32 +291,39 @@ Resources:
           Required: true
           Mutable: true
       LambdaConfig:
-        PreSignUp: !GetAtt EmailDomainValidatorLambda.Arn
+        PreSignUp: !GetAtt PreSignUpLambda.Arn
+        DefineAuthChallenge: !GetAtt DefineAuthChallengeLambda.Arn
+        CreateAuthChallenge: !GetAtt CreateAuthChallengeLambda.Arn
+        VerifyAuthChallengeResponse: !GetAtt VerifyAuthChallengeLambda.Arn
+        PostAuthentication: !GetAtt PostAuthenticationLambda.Arn
       UserPoolTags:
         Environment: !Ref Environment
         Project: !Ref ProjectName
 
-  # Lambda function to validate email domains
-  EmailDomainValidatorLambda:
+  #============================================================================
+  # Pre Sign-Up Lambda (Email Domain Validation + Auto-confirm)
+  #============================================================================
+  PreSignUpLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${ProjectName}-${Environment}-email-validator'
+      FunctionName: !Sub '${ProjectName}-${Environment}-pre-signup'
       Runtime: python3.11
       Handler: index.handler
       Timeout: 10
-      Role: !GetAtt EmailDomainValidatorRole.Arn
+      Role: !GetAtt CognitoLambdaRole.Arn
       Environment:
         Variables:
           ALLOWED_DOMAINS: !Join [',', !Ref AllowedEmailDomains]
       Code:
         ZipFile: |
           import os
-          import json
 
           def handler(event, context):
               """
-              Cognito Pre Sign-up trigger to validate email domains.
-              Only allows sign-ups from configured allowed domains.
+              Cognito Pre Sign-up trigger:
+              1. Validates email domain against allow-list
+              2. Auto-confirms user (no password needed for magic link flow)
+              3. Auto-verifies email
               """
               allowed_domains = os.environ.get('ALLOWED_DOMAINS', '').split(',')
               allowed_domains = [d.strip().lower() for d in allowed_domains if d.strip()]
@@ -261,11 +336,11 @@ Resources:
               email_domain = email.lower().split('@')[-1]
 
               if allowed_domains and email_domain not in allowed_domains:
-                  raise Exception(f'Email domain {email_domain} is not allowed. Allowed domains: {", ".join(allowed_domains)}')
+                  raise Exception(f'Email domain {email_domain} is not allowed')
 
-              # Auto-confirm if domain is allowed (optional)
-              event['response']['autoConfirmUser'] = False
-              event['response']['autoVerifyEmail'] = False
+              # Auto-confirm and verify for magic link flow
+              event['response']['autoConfirmUser'] = True
+              event['response']['autoVerifyEmail'] = True
 
               return event
       Tags:
@@ -274,10 +349,383 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  EmailDomainValidatorRole:
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreSignUpLambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  #============================================================================
+  # Define Auth Challenge Lambda
+  #============================================================================
+  DefineAuthChallengeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-define-auth'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt CognitoLambdaRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              """
+              Define Auth Challenge: Orchestrates the magic link auth flow.
+              """
+              session = event['request'].get('session', [])
+
+              if len(session) == 0:
+                  # First call: Issue CUSTOM_CHALLENGE to send magic link
+                  event['response']['issueTokens'] = False
+                  event['response']['failAuthentication'] = False
+                  event['response']['challengeName'] = 'CUSTOM_CHALLENGE'
+              elif len(session) == 1:
+                  # Second call: Check if magic link was verified
+                  last = session[-1]
+                  if last.get('challengeName') == 'CUSTOM_CHALLENGE':
+                      if last.get('challengeResult') == True:
+                          # Magic link verified, issue tokens
+                          event['response']['issueTokens'] = True
+                          event['response']['failAuthentication'] = False
+                      else:
+                          # Invalid magic link
+                          event['response']['issueTokens'] = False
+                          event['response']['failAuthentication'] = True
+                  else:
+                      event['response']['issueTokens'] = False
+                      event['response']['failAuthentication'] = True
+              else:
+                  # Too many attempts
+                  event['response']['issueTokens'] = False
+                  event['response']['failAuthentication'] = True
+
+              return event
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefineAuthChallengePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DefineAuthChallengeLambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  #============================================================================
+  # Create Auth Challenge Lambda (Generates Magic Link)
+  #============================================================================
+  CreateAuthChallengeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-create-auth'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt MagicLinkLambdaRole.Arn
+      Environment:
+        Variables:
+          MAGIC_LINK_TABLE: !Ref MagicLinkTable
+          MAGIC_LINK_EXPIRY_MINUTES: !Ref MagicLinkExpiryMinutes
+          APP_DOMAIN: !Ref AppDomainName
+          FROM_EMAIL: !Sub 'noreply@${AppDomainName}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import secrets
+          import time
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          ses = boto3.client('ses')
+
+          def handler(event, context):
+              """
+              Create Auth Challenge: Generates magic link and sends email.
+              """
+              table_name = os.environ['MAGIC_LINK_TABLE']
+              expiry_minutes = int(os.environ.get('MAGIC_LINK_EXPIRY_MINUTES', 15))
+              app_domain = os.environ['APP_DOMAIN']
+              from_email = os.environ['FROM_EMAIL']
+
+              email = event['request']['userAttributes']['email']
+              user_sub = event['request']['userAttributes']['sub']
+
+              # Generate secure token
+              token = secrets.token_urlsafe(32)
+              ttl = int(time.time()) + (expiry_minutes * 60)
+
+              # Store token in DynamoDB
+              table = dynamodb.Table(table_name)
+              table.put_item(Item={
+                  'token': token,
+                  'email': email,
+                  'userSub': user_sub,
+                  'ttl': ttl,
+                  'used': False
+              })
+
+              # Create magic link URL
+              magic_link = f'https://{app_domain}/auth/verify?token={token}'
+
+              # Send email via SES
+              try:
+                  ses.send_email(
+                      Source=from_email,
+                      Destination={'ToAddresses': [email]},
+                      Message={
+                          'Subject': {'Data': 'Sign in to Phoenix'},
+                          'Body': {
+                              'Html': {
+                                  'Data': f'''
+                                  <html>
+                                  <body style="font-family: Arial, sans-serif; padding: 20px;">
+                                      <h2>Sign in to Phoenix</h2>
+                                      <p>Click the button below to sign in. This link expires in {expiry_minutes} minutes.</p>
+                                      <p style="margin: 30px 0;">
+                                          <a href="{magic_link}"
+                                             style="background-color: #4F46E5; color: white; padding: 12px 24px;
+                                                    text-decoration: none; border-radius: 6px; display: inline-block;">
+                                              Sign in to Phoenix
+                                          </a>
+                                      </p>
+                                      <p style="color: #666; font-size: 12px;">
+                                          If you didn't request this email, you can safely ignore it.
+                                      </p>
+                                  </body>
+                                  </html>
+                                  '''
+                              },
+                              'Text': {
+                                  'Data': f'Sign in to Phoenix:\n\n{magic_link}\n\nThis link expires in {expiry_minutes} minutes.'
+                              }
+                          }
+                      }
+                  )
+              except Exception as e:
+                  print(f'Failed to send email: {e}')
+                  raise Exception('Failed to send magic link email')
+
+              # Return challenge metadata (client needs to wait for email)
+              event['response']['publicChallengeParameters'] = {
+                  'email': email,
+                  'message': 'Magic link sent to your email'
+              }
+              event['response']['privateChallengeParameters'] = {
+                  'token': token
+              }
+
+              return event
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CreateAuthChallengePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateAuthChallengeLambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  #============================================================================
+  # Verify Auth Challenge Lambda (Validates Magic Link Token)
+  #============================================================================
+  VerifyAuthChallengeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-verify-auth'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt MagicLinkLambdaRole.Arn
+      Environment:
+        Variables:
+          MAGIC_LINK_TABLE: !Ref MagicLinkTable
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              """
+              Verify Auth Challenge: Validates the magic link token.
+              """
+              table_name = os.environ['MAGIC_LINK_TABLE']
+              table = dynamodb.Table(table_name)
+
+              # Get the token from user's response
+              challenge_answer = event['request'].get('challengeAnswer', '')
+              expected_token = event['request']['privateChallengeParameters'].get('token', '')
+              user_sub = event['request']['userAttributes']['sub']
+
+              # Verify token matches and is valid
+              if not challenge_answer:
+                  event['response']['answerCorrect'] = False
+                  return event
+
+              try:
+                  response = table.get_item(Key={'token': challenge_answer})
+                  item = response.get('Item')
+
+                  if not item:
+                      print('Token not found')
+                      event['response']['answerCorrect'] = False
+                      return event
+
+                  # Check token is for this user
+                  if item.get('userSub') != user_sub:
+                      print('Token user mismatch')
+                      event['response']['answerCorrect'] = False
+                      return event
+
+                  # Check not expired
+                  if item.get('ttl', 0) < int(time.time()):
+                      print('Token expired')
+                      event['response']['answerCorrect'] = False
+                      return event
+
+                  # Check not already used
+                  if item.get('used', False):
+                      print('Token already used')
+                      event['response']['answerCorrect'] = False
+                      return event
+
+                  # Mark token as used
+                  table.update_item(
+                      Key={'token': challenge_answer},
+                      UpdateExpression='SET used = :used',
+                      ExpressionAttributeValues={':used': True}
+                  )
+
+                  event['response']['answerCorrect'] = True
+
+              except Exception as e:
+                  print(f'Error verifying token: {e}')
+                  event['response']['answerCorrect'] = False
+
+              return event
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  VerifyAuthChallengePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VerifyAuthChallengeLambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  #============================================================================
+  # Post Authentication Lambda (Session Limit Enforcement)
+  #============================================================================
+  PostAuthenticationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-post-auth'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt MagicLinkLambdaRole.Arn
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref UserSessionsTable
+          MAX_SESSIONS: !Ref MaxConcurrentSessions
+          SESSION_DURATION_DAYS: !Ref SessionDurationDays
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import uuid
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              """
+              Post Authentication: Enforces max concurrent sessions.
+              Removes oldest session if limit exceeded.
+              """
+              table_name = os.environ['SESSIONS_TABLE']
+              max_sessions = int(os.environ.get('MAX_SESSIONS', 2))
+              session_days = int(os.environ.get('SESSION_DURATION_DAYS', 7))
+
+              table = dynamodb.Table(table_name)
+              user_sub = event['request']['userAttributes']['sub']
+
+              # Generate new session ID
+              session_id = str(uuid.uuid4())
+              ttl = int(time.time()) + (session_days * 24 * 60 * 60)
+
+              # Get all active sessions for this user
+              response = table.query(
+                  KeyConditionExpression=Key('userId').eq(user_sub)
+              )
+              sessions = response.get('Items', [])
+
+              # Filter out expired sessions
+              current_time = int(time.time())
+              active_sessions = [s for s in sessions if s.get('ttl', 0) > current_time]
+
+              # If at limit, remove oldest session(s)
+              if len(active_sessions) >= max_sessions:
+                  # Sort by creation time, remove oldest
+                  active_sessions.sort(key=lambda x: x.get('createdAt', 0))
+                  sessions_to_remove = active_sessions[:len(active_sessions) - max_sessions + 1]
+
+                  for old_session in sessions_to_remove:
+                      table.delete_item(Key={
+                          'userId': user_sub,
+                          'sessionId': old_session['sessionId']
+                      })
+
+              # Create new session
+              table.put_item(Item={
+                  'userId': user_sub,
+                  'sessionId': session_id,
+                  'createdAt': int(time.time()),
+                  'ttl': ttl,
+                  'email': event['request']['userAttributes'].get('email', ''),
+                  'deviceInfo': event['request'].get('clientMetadata', {}).get('deviceInfo', 'unknown')
+              })
+
+              return event
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PostAuthenticationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PostAuthenticationLambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  #============================================================================
+  # IAM Role for Cognito Lambda Triggers (Basic)
+  #============================================================================
+  CognitoLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectName}-${Environment}-email-validator-role'
+      RoleName: !Sub '${ProjectName}-${Environment}-cognito-lambda-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -288,30 +736,74 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-  EmailDomainValidatorPermission:
-    Type: AWS::Lambda::Permission
+  #============================================================================
+  # IAM Role for Magic Link Lambdas (DynamoDB + SES access)
+  #============================================================================
+  MagicLinkLambdaRole:
+    Type: AWS::IAM::Role
     Properties:
-      FunctionName: !Ref EmailDomainValidatorLambda
-      Action: lambda:InvokeFunction
-      Principal: cognito-idp.amazonaws.com
-      SourceArn: !GetAtt UserPool.Arn
+      RoleName: !Sub '${ProjectName}-${Environment}-magic-link-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt MagicLinkTable.Arn
+                  - !GetAtt UserSessionsTable.Arn
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KMSKey.Arn
 
+  #============================================================================
+  # User Pool Client (Magic Link Custom Auth)
+  #============================================================================
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       ClientName: !Sub '${ProjectName}-${Environment}-client'
       UserPoolId: !Ref UserPool
-      GenerateSecret: true
+      GenerateSecret: false
       ExplicitAuthFlows:
-        - ALLOW_USER_PASSWORD_AUTH
-        - ALLOW_USER_SRP_AUTH
+        - ALLOW_CUSTOM_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
       SupportedIdentityProviders:
         - COGNITO
       CallbackURLs:
-        - !Sub 'https://${ProjectName}.${Environment}.example.com/oauth2/callback'
+        - !Sub 'https://${AppDomainName}/oauth2/callback'
+        - !Sub 'https://${AppDomainName}/auth/callback'
       LogoutURLs:
-        - !Sub 'https://${ProjectName}.${Environment}.example.com/logout'
+        - !Sub 'https://${AppDomainName}/logout'
       AllowedOAuthFlows:
         - code
       AllowedOAuthScopes:
@@ -320,12 +812,12 @@ Resources:
         - profile
       AllowedOAuthFlowsUserPoolClient: true
       PreventUserExistenceErrors: ENABLED
-      AccessTokenValidity: 1
-      IdTokenValidity: 1
-      RefreshTokenValidity: 30
+      AccessTokenValidity: !Ref SessionDurationDays
+      IdTokenValidity: !Ref SessionDurationDays
+      RefreshTokenValidity: !Ref SessionDurationDays
       TokenValidityUnits:
-        AccessToken: hours
-        IdToken: hours
+        AccessToken: days
+        IdToken: days
         RefreshToken: days
 
   UserPoolDomain:
@@ -374,3 +866,19 @@ Outputs:
   CognitoIssuerURL:
     Description: Cognito Issuer URL for OAuth2
     Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  MagicLinkTableName:
+    Description: DynamoDB table for magic link tokens
+    Value: !Ref MagicLinkTable
+
+  UserSessionsTableName:
+    Description: DynamoDB table for user sessions
+    Value: !Ref UserSessionsTable
+
+  MaxConcurrentSessions:
+    Description: Maximum concurrent sessions per user
+    Value: !Ref MaxConcurrentSessions
+
+  SessionDurationDays:
+    Description: Session duration in days
+    Value: !Ref SessionDurationDays
