@@ -812,12 +812,13 @@ Resources:
         - profile
       AllowedOAuthFlowsUserPoolClient: true
       PreventUserExistenceErrors: ENABLED
-      AccessTokenValidity: !Ref SessionDurationDays
-      IdTokenValidity: !Ref SessionDurationDays
+      # Access/ID tokens max 1 day; Refresh token for session duration
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
       RefreshTokenValidity: !Ref SessionDurationDays
       TokenValidityUnits:
-        AccessToken: days
-        IdToken: days
+        AccessToken: hours
+        IdToken: hours
         RefreshToken: days
 
   UserPoolDomain:
