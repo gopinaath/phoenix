@@ -10,8 +10,8 @@ Parameters:
     Type: String
   AllowedEmailDomains:
     Type: CommaDelimitedList
-    Default: 'example.com,company.com'
-    Description: Comma-separated list of allowed email domains for Cognito sign-up
+    Default: ''
+    Description: Comma-separated list of allowed email domains (leave empty to allow all domains)
   MagicLinkExpiryMinutes:
     Type: Number
     Default: 15
