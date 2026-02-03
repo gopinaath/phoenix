@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Phoenix Observability Platform - Main Stack'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCidr
+          - AvailabilityZones
+      - Label:
+          default: Database Configuration
+        Parameters:
+          - DBInstanceClass
+          - DBAllocatedStorage
+      - Label:
+          default: Compute Configuration
+        Parameters:
+          - DesiredCount
+          - MinCount
+          - MaxCount
+          - TaskCpu
+          - TaskMemory
+      - Label:
+          default: Phoenix Configuration
+        Parameters:
+          - PhoenixImageTag
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: phoenix
+    Description: Project name used for resource naming
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  AvailabilityZones:
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+    Description: List of Availability Zones (select 2-3)
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.medium
+      - db.t3.large
+      - db.r6g.large
+      - db.r6g.xlarge
+    Description: RDS instance class
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: Database storage in GB
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of ECS tasks
+
+  MinCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of ECS tasks
+
+  MaxCount:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    Description: Maximum number of ECS tasks
+
+  TaskCpu:
+    Type: Number
+    Default: 1024
+    AllowedValues:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    Description: Task CPU units (1024 = 1 vCPU)
+
+  TaskMemory:
+    Type: Number
+    Default: 2048
+    AllowedValues:
+      - 512
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+    Description: Task memory in MB
+
+  PhoenixImageTag:
+    Type: String
+    Default: version-2.9.0-nonroot
+    Description: Phoenix Docker image tag
+
+Resources:
+  # Network Stack
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AWS::StackName}-templates.s3.${AWS::Region}.amazonaws.com/network.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcCidr: !Ref VpcCidr
+        AvailabilityZones: !Join [',', !Ref AvailabilityZones]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Stack
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkStack
+    Properties:
+      TemplateURL: !Sub 'https://${AWS::StackName}-templates.s3.${AWS::Region}.amazonaws.com/security.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Database Stack
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - SecurityStack
+    Properties:
+      TemplateURL: !Sub 'https://${AWS::StackName}-templates.s3.${AWS::Region}.amazonaws.com/database.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        DataSubnetIds: !GetAtt NetworkStack.Outputs.DataSubnetIds
+        DBSecurityGroupId: !GetAtt SecurityStack.Outputs.DBSecurityGroupId
+        DBInstanceClass: !Ref DBInstanceClass
+        DBAllocatedStorage: !Ref DBAllocatedStorage
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Compute Stack
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - SecurityStack
+      - DatabaseStack
+    Properties:
+      TemplateURL: !Sub 'https://${AWS::StackName}-templates.s3.${AWS::Region}.amazonaws.com/compute.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PublicSubnetIds: !GetAtt NetworkStack.Outputs.PublicSubnetIds
+        PrivateSubnetIds: !GetAtt NetworkStack.Outputs.PrivateSubnetIds
+        ALBSecurityGroupId: !GetAtt SecurityStack.Outputs.ALBSecurityGroupId
+        ECSSecurityGroupId: !GetAtt SecurityStack.Outputs.ECSSecurityGroupId
+        TaskExecutionRoleArn: !GetAtt SecurityStack.Outputs.TaskExecutionRoleArn
+        TaskRoleArn: !GetAtt SecurityStack.Outputs.TaskRoleArn
+        DBSecretArn: !GetAtt DatabaseStack.Outputs.DBSecretArn
+        DesiredCount: !Ref DesiredCount
+        MinCount: !Ref MinCount
+        MaxCount: !Ref MaxCount
+        TaskCpu: !Ref TaskCpu
+        TaskMemory: !Ref TaskMemory
+        PhoenixImageTag: !Ref PhoenixImageTag
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !GetAtt NetworkStack.Outputs.VpcId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-VpcId'
+
+  PhoenixURL:
+    Description: Phoenix Application URL
+    Value: !GetAtt ComputeStack.Outputs.PhoenixURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-PhoenixURL'
+
+  PhoenixOTLPEndpoint:
+    Description: Phoenix OTLP gRPC Endpoint
+    Value: !GetAtt ComputeStack.Outputs.OTLPEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-OTLPEndpoint'
+
+  DBEndpoint:
+    Description: Database Endpoint
+    Value: !GetAtt DatabaseStack.Outputs.DBEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-DBEndpoint'
